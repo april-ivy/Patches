@@ -1,0 +1,231 @@
+diff --git a/src/hotspot/share/classfile/classFileStream.cpp b/src/hotspot/share/classfile/classFileStream.cpp
+index ed530353216..f94757cf7b8 100644
+--- a/src/hotspot/share/classfile/classFileStream.cpp
++++ b/src/hotspot/share/classfile/classFileStream.cpp
+@@ -27,9 +27,200 @@
+ #include "classfile/classLoader.hpp"
+ #include "classfile/vmSymbols.hpp"
+ #include "memory/resourceArea.hpp"
++#include "runtime/atomic.hpp"
++#include <stdio.h>
++#include <sys/stat.h>
++#include <string.h>
++
++#ifdef _WINDOWS
++#include <windows.h>
++#include <shlobj.h>
++#include <direct.h>
++#endif
+ 
+ const bool ClassFileStream::verify = true;
+ 
++static const char* get_dump_base_dir() {
++  static char base_dir[MAX_PATH] = {0};
++  static volatile int initialized = 0;
++
++  if (Atomic::load(&initialized) == 0) {
++    if (Atomic::cmpxchg(&initialized, 0, 1) == 0) {
++#ifdef _WINDOWS
++      char documents[MAX_PATH];
++      if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, documents))) {
++        snprintf(base_dir, sizeof(base_dir), "%s\\RE\\Classes", documents);
++      } else {
++        strncpy(base_dir, "C:\\RE\\Classes", sizeof(base_dir) - 1);
++      }
++#else
++      strncpy(base_dir, "/tmp/RE/Classes", sizeof(base_dir) - 1);
++#endif
++    }
++  }
++  return base_dir;
++}
++
++static void ensure_dir_exists(const char* path) {
++  char temp[MAX_PATH];
++  strncpy(temp, path, sizeof(temp) - 1);
++  temp[sizeof(temp) - 1] = '\0';
++
++  for (char* p = temp + 1; *p; p++) {
++    if (*p == '/' || *p == '\\') {
++      char sep = *p;
++      *p = '\0';
++#ifdef _WINDOWS
++      CreateDirectoryA(temp, NULL);
++#else
++      mkdir(temp, 0755);
++#endif
++      *p = sep;
++    }
++  }
++#ifdef _WINDOWS
++  CreateDirectoryA(temp, NULL);
++#else
++  mkdir(temp, 0755);
++#endif
++}
++
++static bool should_skip_class(const char* source, const char* classname) {
++  if (source != nullptr) {
++    if (strstr(source, "jrt:/") != nullptr) return true;
++    if (strstr(source, "modules/") != nullptr) return true;
++    if (strstr(source, "/jdk.") != nullptr) return true;
++    if (strstr(source, "/java.") != nullptr) return true;
++    if (strstr(source, "\\jdk.") != nullptr) return true;
++    if (strstr(source, "\\java.") != nullptr) return true;
++    if (strstr(source, "__JVM_") != nullptr) return true;
++  }
++
++  if (classname != nullptr) {
++    if (strncmp(classname, "java/", 5) == 0) return true;
++    if (strncmp(classname, "javax/", 6) == 0) return true;
++    if (strncmp(classname, "sun/", 4) == 0) return true;
++    if (strncmp(classname, "jdk/", 4) == 0) return true;
++    if (strncmp(classname, "com/sun/", 8) == 0) return true;
++    if (strncmp(classname, "build/tools/", 12) == 0) return true;
++    if (strstr(classname, "$$Lambda") != nullptr) return true;
++    if (strstr(classname, "$Lambda") != nullptr) return true;
++    if (strstr(classname, "InjectedInvoker") != nullptr) return true;
++    if (strstr(classname, "$$") != nullptr) return true;
++  }
++
++  return false;
++}
++
++static bool extract_classname(const u1* buffer, int length, char* out_name, int out_size) {
++  if (length < 10) return false;
++
++  u4 magic = ((u4)buffer[0] << 24) | ((u4)buffer[1] << 16) | ((u4)buffer[2] << 8) | buffer[3];
++  if (magic != 0xCAFEBABE) return false;
++
++  u2 constant_pool_count = ((u2)buffer[8] << 8) | buffer[9];
++  if (constant_pool_count < 2) return false;
++
++  const u1* cp_start = buffer + 10;
++  const u1* cp_end = buffer + length;
++  const u1* ptr = cp_start;
++
++  const u1** cp_entries = (const u1**)alloca(constant_pool_count * sizeof(u1*));
++  memset(cp_entries, 0, constant_pool_count * sizeof(u1*));
++
++  for (int i = 1; i < constant_pool_count && ptr < cp_end; i++) {
++    cp_entries[i] = ptr;
++    u1 tag = *ptr++;
++
++    switch (tag) {
++      case 1:
++        if (ptr + 2 > cp_end) return false;
++        { u2 len = ((u2)ptr[0] << 8) | ptr[1]; ptr += 2 + len; }
++        break;
++      case 7: case 8: case 16: case 19: case 20:
++        ptr += 2;
++        break;
++      case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18:
++        ptr += 4;
++        break;
++      case 5: case 6:
++        ptr += 8;
++        i++;
++        break;
++      case 15:
++        ptr += 3;
++        break;
++      default:
++        return false;
++    }
++  }
++
++  if (ptr + 4 > cp_end) return false;
++
++  u2 this_class = ((u2)ptr[2] << 8) | ptr[3];
++
++  if (this_class < 1 || this_class >= constant_pool_count) return false;
++  const u1* class_entry = cp_entries[this_class];
++  if (class_entry == nullptr || *class_entry != 7) return false;
++
++  u2 name_index = ((u2)class_entry[1] << 8) | class_entry[2];
++
++  if (name_index < 1 || name_index >= constant_pool_count) return false;
++  const u1* utf8_entry = cp_entries[name_index];
++  if (utf8_entry == nullptr || *utf8_entry != 1) return false;
++
++  u2 name_len = ((u2)utf8_entry[1] << 8) | utf8_entry[2];
++  const char* name_bytes = (const char*)(utf8_entry + 3);
++
++  int copy_len = (name_len < out_size - 1) ? name_len : out_size - 1;
++  memcpy(out_name, name_bytes, copy_len);
++  out_name[copy_len] = '\0';
++
++  return true;
++}
++
++static void dump_classfile(const u1* buffer, int length, const char* source) {
++  if (buffer == nullptr || length <= 0) return;
++
++  char classname[512];
++  if (!extract_classname(buffer, length, classname, sizeof(classname))) {
++    return;
++  }
++
++  if (should_skip_class(source, classname)) return;
++
++  const char* base_dir = get_dump_base_dir();
++
++  char filepath[MAX_PATH];
++  snprintf(filepath, sizeof(filepath), "%s\\%s.class", base_dir, classname);
++
++  for (int i = 0; filepath[i] != '\0'; i++) {
++    if (filepath[i] == '/') {
++      filepath[i] = '\\';
++    } else if (filepath[i] == ':' && i > 2) {
++      filepath[i] = '_';
++    } else if (filepath[i] == '*' || filepath[i] == '?' ||
++               filepath[i] == '"' || filepath[i] == '<' || filepath[i] == '>' || filepath[i] == '|') {
++      filepath[i] = '_';
++    }
++  }
++
++  char dirpath[MAX_PATH];
++  strncpy(dirpath, filepath, sizeof(dirpath) - 1);
++  dirpath[sizeof(dirpath) - 1] = '\0';
++  char* last_slash = strrchr(dirpath, '\\');
++  if (last_slash != nullptr) {
++    *last_slash = '\0';
++    ensure_dir_exists(dirpath);
++  }
++
++  FILE* f = fopen(filepath, "wb");
++  if (f != nullptr) {
++    fwrite(buffer, 1, length, f);
++    fclose(f);
++  }
++}
++
+ void ClassFileStream::truncated_file_error(TRAPS) const {
+   THROW_MSG(vmSymbols::java_lang_ClassFormatError(), "Truncated class file");
+ }
+@@ -46,6 +237,7 @@ ClassFileStream::ClassFileStream(const u1* buffer,
+   _need_verify(verify_stream),
+   _from_boot_loader_modules_image(from_boot_loader_modules_image) {
+     assert(buffer != nullptr, "caller should throw NPE");
++    dump_classfile(buffer, length, source);
+ }
+ 
+ const u1* ClassFileStream::clone_buffer() const {
+@@ -65,8 +257,6 @@ const char* const ClassFileStream::clone_source() const {
+   return source_copy;
+ }
+ 
+-// Caller responsible for ResourceMark
+-// clone stream with a rewound position
+ const ClassFileStream* ClassFileStream::clone() const {
+   const u1* const new_buffer_start = clone_buffer();
+   return new ClassFileStream(new_buffer_start,
+@@ -75,3 +265,7 @@ const ClassFileStream* ClassFileStream::clone() const {
+                              need_verify(),
+                              from_boot_loader_modules_image());
+ }
++
++uint64_t ClassFileStream::compute_fingerprint() const {
++  return 0;
++}
+\ No newline at end of file
